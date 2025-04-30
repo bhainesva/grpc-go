@@ -20,12 +20,19 @@
 package main
 
 import (
+	"connectrpc.com/grpcreflect"
+	"connectrpc.com/vanguard/vanguardgrpc"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"os"
 	"time"
 
 	"google.golang.org/grpc"
@@ -54,6 +61,10 @@ func (s *server) UnaryEcho(ctx context.Context, in *pb.EchoRequest) (*pb.EchoRes
 		trailer := metadata.Pairs("timestamp", time.Now().Format(timestampFormat))
 		grpc.SetTrailer(ctx, trailer)
 	}()
+
+	if in.GetMessage() == "err" {
+		return nil, status.Errorf(codes.Internal, "induced error")
+	}
 
 	// Read metadata from client.
 	md, ok := metadata.FromIncomingContext(ctx)
@@ -204,5 +215,26 @@ func main() {
 
 	s := grpc.NewServer()
 	pb.RegisterEchoServer(s, &server{})
-	s.Serve(lis)
+
+	handler, err := vanguardgrpc.NewTranscoder(s)
+	FatalIf(err)
+
+	// We use the h2c package in order to support HTTP/2 without TLS,
+	// so we can handle gRPC requests, which requires HTTP/2, in
+	// addition to Connect and gRPC-Web (which work with HTTP 1.1).
+	serveMux := http.NewServeMux()
+	serveMux.Handle("/", handler)
+	serveMux.Handle(grpcreflect.NewHandlerV1(grpcreflect.NewStaticReflector(pb.Echo_ServiceDesc.ServiceName)))
+
+	err = http.Serve(lis, h2c.NewHandler(serveMux, &http2.Server{}))
+	if !errors.Is(err, http.ErrServerClosed) {
+		_, _ = fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func FatalIf(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
 }
